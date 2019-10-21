@@ -11,7 +11,16 @@ module KubernetesDeploy
     end
 
     def self.client
-      @client ||= ::StatsD::Instrument::Client.new(prefix: PREFIX)
+      @client ||= begin
+        sink = if ::StatsD::Instrument::Environment.current.env.fetch('STATSD_ENV', nil) == 'development'
+          ::StatsD::Instrument::LogSink.new(Logger.new($stderr))
+        elsif (addr = ::StatsD::Instrument::Environment.current.env.fetch('STATSD_ADDR', nil))
+          ::StatsD::Instrument::UDPSink.for_addr(addr)
+        else
+          ::StatsD::Instrument::NullSink.new
+        end
+        ::StatsD::Instrument::Client.new(prefix: PREFIX, sink: sink, default_sample_rate: 1.0)
+      end
     end
 
     module MeasureMethods
