@@ -200,25 +200,28 @@ module KubernetesDeploy
         MSG
         @logger.summary.add_paragraph(ColorizedString.new(warning).yellow)
       end
+      tags = statsd_tags + ["status:success"]
       StatsD.client.event("Deployment of #{@namespace} succeeded",
         "Successfully deployed all #{@namespace} resources to #{@context}",
-        alert_type: "success", tags: statsd_tags << "status:success")
-      StatsD.client.distribution('all_resources.duration', StatsD.duration(start), tags: statsd_tags << "status:success")
+        alert_type: "success", tags: tags)
+      StatsD.client.distribution('all_resources.duration', StatsD.duration(start), tags: tags)
       @logger.print_summary(:success)
     rescue DeploymentTimeoutError
       @logger.print_summary(:timed_out)
+      tags = statsd_tags + ["status:timeout"]
       StatsD.client.event("Deployment of #{@namespace} timed out",
         "One or more #{@namespace} resources failed to deploy to #{@context} in time",
-        alert_type: "error", tags: statsd_tags << "status:timeout")
-      StatsD.client.distribution('all_resources.duration', StatsD.duration(start), tags: statsd_tags << "status:timeout")
+        alert_type: "error", tags: tags)
+      StatsD.client.distribution('all_resources.duration', StatsD.duration(start), tags: tags)
       raise
     rescue FatalDeploymentError => error
       @logger.summary.add_action(error.message) if error.message != error.class.to_s
       @logger.print_summary(:failure)
+      tags = statsd_tags + ["status:failed"]
       StatsD.client.event("Deployment of #{@namespace} failed",
         "One or more #{@namespace} resources failed to deploy to #{@context}",
-        alert_type: "error", tags: statsd_tags << "status:failed")
-      StatsD.client.distribution('all_resources.duration', StatsD.duration(start), tags: statsd_tags << "status:failed")
+        alert_type: "error", tags: tags)
+      StatsD.client.distribution('all_resources.duration', StatsD.duration(start), tags: tags)
       raise
     end
 
