@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 require 'kubernetes-deploy/kubernetes_resource/pod_set_base'
+
 module KubernetesDeploy
   class DaemonSet < PodSetBase
     TIMEOUT = 5.minutes
+    PREFETCH_KINDS_ON_SYNC = [Pod.kind]
     attr_reader :pods
 
     def sync(cache)

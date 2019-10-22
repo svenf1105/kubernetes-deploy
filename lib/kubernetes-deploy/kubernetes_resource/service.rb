@@ -1,9 +1,11 @@
 # frozen_string_literal: true
 require 'kubernetes-deploy/kubernetes_resource/pod'
+require 'kubernetes-deploy/kubernetes_resource/stateful_set'
 
 module KubernetesDeploy
   class Service < KubernetesResource
     TIMEOUT = 7.minutes
+    PREFETCH_KINDS_ON_SYNC = [Pod.kind, Deployment.kind, StatefulSet.kind]
 
     def sync(cache)
       super

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 module KubernetesDeploy
   class Job < KubernetesResource
+    PREFETCH_KINDS_ON_SYNC = [Pod.kind]
     TIMEOUT = 10.minutes
 
     def deploy_succeeded?

@@ -1,7 +1,11 @@
 # frozen_string_literal: true
+require 'kubernetes-deploy/kubernetes_resource/deployment'
+require 'kubernetes-deploy/kubernetes_resource/service'
+
 module KubernetesDeploy
   class Cloudsql < KubernetesResource
     TIMEOUT = 10.minutes
+    PREFETCH_KINDS_ON_SYNC = [Deployment.kind, Service.kind]
 
     def sync(cache)
       super

@@ -4,6 +4,7 @@ module KubernetesDeploy
   class StatefulSet < PodSetBase
     TIMEOUT = 10.minutes
     ONDELETE = 'OnDelete'
+    PREFETCH_KINDS_ON_SYNC = [Pod.kind]
     attr_reader :pods
 
     def sync(cache)

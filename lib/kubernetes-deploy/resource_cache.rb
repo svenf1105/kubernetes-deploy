@@ -36,6 +36,11 @@ module KubernetesDeploy
       []
     end
 
+    def prewarm(resources)
+      kinds = resources.flat_map(&:prefetch_kinds_on_sync).uniq
+      KubernetesDeploy::Concurrency.split_across_threads(kinds) { |kind| use_or_populate_cache(kind) }
+    end
+
     private
 
     def statsd_tags

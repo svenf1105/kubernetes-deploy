@@ -38,6 +38,7 @@ module KubernetesDeploy
     LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
     SENSITIVE_TEMPLATE_CONTENT = false
     SERVER_DRY_RUNNABLE = false
+    PREFETCH_KINDS_ON_SYNC = []
 
     class << self
       def build(namespace:, context:, definition:, logger:, statsd_tags:, crd: nil, global_names: [])
@@ -419,6 +420,10 @@ module KubernetesDeploy
 
     def global?
       @global || self.class::GLOBAL
+    end
+
+    def prefetch_kinds_on_sync
+      self.class::PREFETCH_KINDS_ON_SYNC
     end
 
     private
