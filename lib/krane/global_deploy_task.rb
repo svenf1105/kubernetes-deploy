@@ -87,8 +87,9 @@ module Krane
 
     def deploy!(resources, verify_result, prune, start)
       prune_whitelist = []
-      deployer = KubernetesDeploy::ResourceDeployer.new(@task_config,
-        prune_whitelist, @max_watch_seconds, @selector, true, statsd_tags)
+      deployer = KubernetesDeploy::ResourceDeployer.new(task_config: @task_config,
+        prune_whitelist: prune_whitelist, max_watch_seconds: @max_watch_seconds,
+        selector: @selector, global_mode: true)
       if verify_result
         deployer.deploy_all_resources(resources, prune: prune, verify: true)
         failed_resources = resources.reject(&:deploy_succeeded?)

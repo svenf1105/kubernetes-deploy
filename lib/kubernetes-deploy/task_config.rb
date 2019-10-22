@@ -8,6 +8,7 @@ module KubernetesDeploy
       @context = context
       @namespace = namespace
       @logger = logger
+      @global_kinds = []
     end
 
     def logger

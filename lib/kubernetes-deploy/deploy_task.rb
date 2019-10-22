@@ -41,6 +41,7 @@ require 'kubernetes-deploy/renderer'
 require 'kubernetes-deploy/cluster_resource_discovery'
 require 'kubernetes-deploy/template_sets'
 require 'kubernetes-deploy/deploy_task_config_validator'
+require 'kubernetes-deploy/resource_deployer'
 
 module KubernetesDeploy
   # Ship resources to a namespace
@@ -175,7 +176,7 @@ module KubernetesDeploy
 
       if deploy_has_priority_resources?(resources)
         @logger.phase_heading("Predeploying priority resources")
-        predeploy_priority_resources(resources)
+        resource_deployer.predeploy_priority_resources(resources, predeploy_sequence)
       end
 
       @logger.phase_heading("Deploying all resources")
@@ -183,8 +184,20 @@ module KubernetesDeploy
         raise FatalDeploymentError, "Refusing to deploy to protected namespace '#{@namespace}' with pruning enabled"
       end
 
+      deploy!(resource, verify_result, prune)
+    end
+
+    private
+
+    def resource_deployer
+      @resource_deployer ||= KubernetesDeploy::ResourceDeployer.new(task_config: @task_config,
+        prune_whitelist: prune_whitelist, max_watch_seconds: @max_watch_seconds,
+        selector: @selector)
+    end
+
+    def deploy!(resources, verify_result, prune, start)
       if verify_result
-        deploy_all_resources(resources, prune: prune, verify: true)
+        resource_deployer.deploy_all_resources(resources, prune: prune, verify: true)
         failed_resources = resources.reject(&:deploy_succeeded?)
         success = failed_resources.empty?
         if !success && failed_resources.all?(&:deploy_timed_out?)
@@ -192,7 +205,7 @@ module KubernetesDeploy
         end
         raise FatalDeploymentError unless success
       else
-        deploy_all_resources(resources, prune: prune, verify: false)
+        resource_deployer.deploy_all_resources(resources, prune: prune, verify: false)
         @logger.summary.add_action("deployed #{resources.length} #{'resource'.pluralize(resources.length)}")
         warning = <<~MSG
           Deploy result verification is disabled for this deploy.
@@ -221,8 +234,6 @@ module KubernetesDeploy
       StatsD.distribution('all_resources.duration', StatsD.duration(start), tags: statsd_tags << "status:failed")
       raise
     end
-
-    private
 
     def global_resource_names
       cluster_resource_discoverer.global_resource_kinds
@@ -254,31 +265,6 @@ module KubernetesDeploy
     def deploy_has_priority_resources?(resources)
       resources.any? { |r| predeploy_sequence.include?(r.type) }
     end
-
-    def predeploy_priority_resources(resource_list)
-      bare_pods = resource_list.select { |resource| resource.is_a?(Pod) }
-      if bare_pods.count == 1
-        bare_pods.first.stream_logs = true
-      end
-
-      predeploy_sequence.each do |resource_type|
-        matching_resources = resource_list.select { |r| r.type == resource_type }
-        next if matching_resources.empty?
-        deploy_resources(matching_resources, verify: true, record_summary: false)
-
-        failed_resources = matching_resources.reject(&:deploy_succeeded?)
-        fail_count = failed_resources.length
-        if fail_count > 0
-          KubernetesDeploy::Concurrency.split_across_threads(failed_resources) do |r|
-            r.sync_debug_info(kubectl)
-          end
-          failed_resources.each { |r| @logger.summary.add_paragraph(r.debug_message) }
-          raise FatalDeploymentError, "Failed to deploy #{fail_count} priority #{'resource'.pluralize(fail_count)}"
-        end
-        @logger.blank_line
-      end
-    end
-    measure_method(:predeploy_priority_resources, 'priority_resources.duration')
 
     def validate_resources(resources)
       KubernetesDeploy::Concurrency.split_across_threads(resources) do |r|
@@ -393,166 +379,6 @@ module KubernetesDeploy
       @logger.info("All required parameters and files are present")
     end
     measure_method(:validate_configuration)
-
-    def deploy_resources(resources, prune: false, verify:, record_summary: true)
-      return if resources.empty?
-      deploy_started_at = Time.now.utc
-
-      if resources.length > 1
-        @logger.info("Deploying resources:")
-        resources.each do |r|
-          @logger.info("- #{r.id} (#{r.pretty_timeout_type})")
-        end
-      else
-        resource = resources.first
-        @logger.info("Deploying #{resource.id} (#{resource.pretty_timeout_type})")
-      end
-
-      # Apply can be done in one large batch, the rest have to be done individually
-      applyables, individuals = resources.partition { |r| r.deploy_method == :apply }
-      # Prunable resources should also applied so that they can  be pruned
-      pruneable_types = prune_whitelist.map { |t| t.split("/").last }
-      applyables += individuals.select { |r| pruneable_types.include?(r.type) }
-
-      individuals.each do |r|
-        r.deploy_started_at = Time.now.utc
-        case r.deploy_method
-        when :replace
-          _, _, replace_st = kubectl.run("replace", "-f", r.file_path, log_failure: false)
-        when :replace_force
-          _, _, replace_st = kubectl.run("replace", "--force", "--cascade", "-f", r.file_path,
-            log_failure: false)
-        else
-          # Fail Fast! This is a programmer mistake.
-          raise ArgumentError, "Unexpected deploy method! (#{r.deploy_method.inspect})"
-        end
-
-        next if replace_st.success?
-        # it doesn't exist so we can't replace it
-        _, err, create_st = kubectl.run("create", "-f", r.file_path, log_failure: false)
-
-        next if create_st.success?
-        raise FatalDeploymentError, <<~MSG
-          Failed to replace or create resource: #{r.id}
-          #{err}
-        MSG
-      end
-
-      apply_all(applyables, prune)
-
-      if verify
-        watcher = ResourceWatcher.new(resources: resources, deploy_started_at: deploy_started_at,
-          timeout: @max_watch_seconds, task_config: @task_config, sha: @current_sha)
-        watcher.run(record_summary: record_summary)
-      end
-    end
-
-    def deploy_all_resources(resources, prune: false, verify:, record_summary: true)
-      deploy_resources(resources, prune: prune, verify: verify, record_summary: record_summary)
-    end
-    measure_method(:deploy_all_resources, 'normal_resources.duration')
-
-    def apply_all(resources, prune)
-      return unless resources.present?
-      command = %w(apply)
-
-      Dir.mktmpdir do |tmp_dir|
-        resources.each do |r|
-          FileUtils.symlink(r.file_path, tmp_dir)
-          r.deploy_started_at = Time.now.utc
-        end
-        command.push("-f", tmp_dir)
-
-        if prune
-          command.push("--prune")
-          if @selector
-            command.push("--selector", @selector.to_s)
-          else
-            command.push("--all")
-          end
-          prune_whitelist.each { |type| command.push("--prune-whitelist=#{type}") }
-        end
-
-        output_is_sensitive = resources.any?(&:sensitive_template_content?)
-        out, err, st = kubectl.run(*command, log_failure: false, output_is_sensitive: output_is_sensitive)
-
-        if st.success?
-          log_pruning(out) if prune
-        else
-          record_apply_failure(err, resources: resources)
-          raise FatalDeploymentError, "Command failed: #{Shellwords.join(command)}"
-        end
-      end
-    end
-    measure_method(:apply_all)
-
-    def log_pruning(kubectl_output)
-      pruned = kubectl_output.scan(/^(.*) pruned$/)
-      return unless pruned.present?
-
-      @logger.info("The following resources were pruned: #{pruned.join(', ')}")
-      @logger.summary.add_action("pruned #{pruned.length} #{'resource'.pluralize(pruned.length)}")
-    end
-
-    def record_apply_failure(err, resources: [])
-      warn_msg = "WARNING: Any resources not mentioned in the error(s) below were likely created/updated. " \
-        "You may wish to roll back this deploy."
-      @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
-
-      unidentified_errors = []
-      filenames_with_sensitive_content = resources
-        .select(&:sensitive_template_content?)
-        .map { |r| File.basename(r.file_path) }
-
-      server_dry_run_validated_resource = resources
-        .select(&:server_dry_run_validated?)
-        .map { |r| File.basename(r.file_path) }
-
-      err.each_line do |line|
-        bad_files = find_bad_files_from_kubectl_output(line)
-        unless bad_files.present?
-          unidentified_errors << line
-          next
-        end
-
-        bad_files.each do |f|
-          err_msg = f[:err]
-          if filenames_with_sensitive_content.include?(f[:filename])
-            # Hide the error and template contents in case it has sensitive information
-            # we display full error messages as we assume there's no sensitive info leak after server-dry-run
-            err_msg = "SUPPRESSED FOR SECURITY" unless server_dry_run_validated_resource.include?(f[:filename])
-            record_invalid_template(err: err_msg, filename: f[:filename], content: nil)
-          else
-            record_invalid_template(err: err_msg, filename: f[:filename], content: f[:content])
-          end
-        end
-      end
-      return unless unidentified_errors.any?
-
-      if (filenames_with_sensitive_content - server_dry_run_validated_resource).present?
-        warn_msg = "WARNING: There was an error applying some or all resources. The raw output may be sensitive and " \
-          "so cannot be displayed."
-        @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
-      else
-        heading = ColorizedString.new('Unidentified error(s):').red
-        msg = FormattedLogger.indent_four(unidentified_errors.join)
-        @logger.summary.add_paragraph("#{heading}\n#{msg}")
-      end
-    end
-
-    # Inspect the file referenced in the kubectl stderr
-    # to make it easier for developer to understand what's going on
-    def find_bad_files_from_kubectl_output(line)
-      # stderr often contains one or more lines like the following, from which we can extract the file path(s):
-      # Error from server (TypeOfError): error when creating "/path/to/service-gqq5oh.yml": Service "web" is invalid:
-
-      line.scan(%r{"(/\S+\.ya?ml\S*)"}).each_with_object([]) do |matches, bad_files|
-        matches.each do |path|
-          content = File.read(path) if File.file?(path)
-          bad_files << { filename: File.basename(path), err: line, content: content }
-        end
-      end
-    end
 
     def namespace_definition
       @namespace_definition ||= begin

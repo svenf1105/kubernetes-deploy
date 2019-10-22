@@ -8,7 +8,7 @@ module KubernetesDeploy
 
     delegate :logger, to: :@task_config
 
-    def initialize(task_config, prune_whitelist, max_watch_seconds, current_sha = nil, selector, global_mode)
+    def initialize(task_config:, prune_whitelist:, max_watch_seconds:, current_sha: nil, selector:, global_mode: false)
       @task_config = task_config
       @prune_whitelist = prune_whitelist
       @max_watch_seconds = max_watch_seconds
@@ -21,6 +21,31 @@ module KubernetesDeploy
       deploy_resources(resources, prune: prune, verify: verify, record_summary: record_summary)
     end
     measure_method(:deploy_all_resources, 'normal_resources.duration')
+
+    def predeploy_priority_resources(resource_list, predeploy_sequence)
+      bare_pods = resource_list.select { |resource| resource.is_a?(Pod) }
+      if bare_pods.count == 1
+        bare_pods.first.stream_logs = true
+      end
+
+      predeploy_sequence.each do |resource_type|
+        matching_resources = resource_list.select { |r| r.type == resource_type }
+        next if matching_resources.empty?
+        deploy_resources(matching_resources, verify: true, record_summary: false)
+
+        failed_resources = matching_resources.reject(&:deploy_succeeded?)
+        fail_count = failed_resources.length
+        if fail_count > 0
+          KubernetesDeploy::Concurrency.split_across_threads(failed_resources) do |r|
+            r.sync_debug_info(kubectl)
+          end
+          failed_resources.each { |r| logger.summary.add_paragraph(r.debug_message) }
+          raise FatalDeploymentError, "Failed to deploy #{fail_count} priority #{'resource'.pluralize(fail_count)}"
+        end
+        logger.blank_line
+      end
+    end
+    measure_method(:predeploy_priority_resources, 'priority_resources.duration')
 
     private
 
