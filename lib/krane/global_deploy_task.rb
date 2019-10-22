@@ -87,9 +87,47 @@ module Krane
 
     def deploy!(resources, verify_result, prune, start)
       prune_whitelist = []
-      deployer = KubernetesDeploy::ResourceDeployer.new(@task_config, resources, prune,
-        verify_result, prune_whitelist, @max_watch_seconds, @selector, true, statsd_tags)
-      deployer.run!(start)
+      deployer = KubernetesDeploy::ResourceDeployer.new(@task_config,
+        prune_whitelist, @max_watch_seconds, @selector, true, statsd_tags)
+      if verify_result
+        deployer.deploy_all_resources(resources, prune: prune, verify: true)
+        failed_resources = resources.reject(&:deploy_succeeded?)
+        success = failed_resources.empty?
+        if !success && failed_resources.all?(&:deploy_timed_out?)
+          raise KubernetesDeploy::DeploymentTimeoutError
+        end
+        raise KubernetesDeploy::FatalDeploymentError unless success
+      else
+        deployer.deploy_all_resources(resources, prune: prune, verify: false)
+        logger.summary.add_action("deployed #{resources.length} #{'resource'.pluralize(resources.length)}")
+        warning = <<~MSG
+          Deploy result verification is disabled for this deploy.
+          This means the desired changes were communicated to Kubernetes, but the deploy did not make sure they actually succeeded.
+        MSG
+        logger.summary.add_paragraph(ColorizedString.new(warning).yellow)
+      end
+
+      StatsD.event("Deployment succeeded",
+        "Successfully deployed all resources to #{context}",
+        alert_type: "success", tags: statsd_tags << "status:success")
+      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start), tags: statsd_tags << "status:success")
+      logger.print_summary(:success)
+
+    rescue KubernetesDeploy::DeploymentTimeoutError
+      logger.print_summary(:timed_out)
+      StatsD.event("Deployment timed out",
+        "One or more resources failed to deploy to #{context} in time",
+        alert_type: "error", tags: statsd_tags << "status:timeout")
+      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start), tags: statsd_tags << "status:timeout")
+      raise
+    rescue KubernetesDeploy::FatalDeploymentError => error
+      logger.summary.add_action(error.message) if error.message != error.class.to_s
+      logger.print_summary(:failure)
+      StatsD.event("Deployment failed",
+        "One or more resources failed to deploy to #{context}",
+        alert_type: "error", tags: statsd_tags << "status:failed")
+      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start), tags: statsd_tags << "status:failed")
+      raise
     end
 
     def validate_configuration

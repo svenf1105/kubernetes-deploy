@@ -1,73 +1,28 @@
 # frozen_string_literal: true
 
+require 'kubernetes-deploy/resource_watcher'
+
 module KubernetesDeploy
   class ResourceDeployer
     extend KubernetesDeploy::StatsD::MeasureMethods
 
     delegate :logger, to: :@task_config
 
-    def initialize(task_config, resources, prune, verify_result, prune_whitelist, max_watch_seconds, current_sha = nil, selector, global_mode, statsd_tags)
+    def initialize(task_config, prune_whitelist, max_watch_seconds, current_sha = nil, selector, global_mode)
       @task_config = task_config
-      @resources = resources
-      @prune = prune
-      @verify_result = verify_result
       @prune_whitelist = prune_whitelist
       @max_watch_seconds = max_watch_seconds
       @current_sha = current_sha
       @selector = selector
       @global_mode = global_mode
-      @statsd_tags = statsd_tags
     end
-
-    # Should the public interface to this method actually be deploy_all_resources?
-    def run!(start)
-      if @verify_result
-        deploy_all_resources(@resources, prune: @prune, verify: true)
-        failed_resources = @resources.reject(&:deploy_succeeded?)
-        success = failed_resources.empty?
-        if !success && failed_resources.all?(&:deploy_timed_out?)
-          raise DeploymentTimeoutError
-        end
-        raise FatalDeploymentError unless success
-      else
-        deploy_all_resources(@resources, prune: @prune, verify: false)
-        logger.summary.add_action("deployed #{resources.length} #{'resource'.pluralize(resources.length)}")
-        warning = <<~MSG
-          Deploy result verification is disabled for this deploy.
-          This means the desired changes were communicated to Kubernetes, but the deploy did not make sure they actually succeeded.
-        MSG
-        logger.summary.add_paragraph(ColorizedString.new(warning).yellow)
-      end
-
-      StatsD.event("Deployment of #{@namespace} succeeded",
-        "Successfully deployed all #{@namespace} resources to #{@context}",
-        alert_type: "success", tags: @statsd_tags << "status:success")
-      StatsD.distribution('all_resources.duration', StatsD.duration(start), tags: @statsd_tags << "status:success")
-      logger.print_summary(:success)
-
-    rescue DeploymentTimeoutError
-      logger.print_summary(:timed_out)
-      StatsD.event("Deployment of #{@namespace} timed out",
-        "One or more #{@namespace} resources failed to deploy to #{@context} in time",
-        alert_type: "error", tags: @statsd_tags << "status:timeout")
-      StatsD.distribution('all_resources.duration', StatsD.duration(start), tags: @statsd_tags << "status:timeout")
-      raise
-    rescue FatalDeploymentError => error
-      logger.summary.add_action(error.message) if error.message != error.class.to_s
-      logger.print_summary(:failure)
-      StatsD.event("Deployment of #{@namespace} failed",
-        "One or more #{@namespace} resources failed to deploy to #{@context}",
-        alert_type: "error", tags: @statsd_tags << "status:failed")
-      StatsD.distribution('all_resources.duration', StatsD.duration(start), tags: @statsd_tags << "status:failed")
-      raise
-    end
-
-    private
 
     def deploy_all_resources(resources, prune: false, verify:, record_summary: true)
       deploy_resources(resources, prune: prune, verify: verify, record_summary: record_summary)
     end
     measure_method(:deploy_all_resources, 'normal_resources.duration')
+
+    private
 
     def deploy_resources(resources, prune: false, verify:, record_summary: true)
       return if resources.empty?
@@ -115,8 +70,8 @@ module KubernetesDeploy
 
       apply_all(applyables, prune)
 
-      if @verify
-        watcher = ResourceWatcher.new(resources: @resources, deploy_started_at: deploy_started_at,
+      if verify
+        watcher = KubernetesDeploy::ResourceWatcher.new(resources: resources, deploy_started_at: deploy_started_at,
           timeout: @max_watch_seconds, task_config: @task_config, sha: @current_sha)
         watcher.run(record_summary: record_summary)
       end
