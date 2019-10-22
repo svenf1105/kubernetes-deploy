@@ -1,26 +1,44 @@
 # frozen_string_literal: true
 
 require 'kubernetes-deploy/resource_watcher'
+require 'krane/concerns/template_reporting'
 
 module KubernetesDeploy
   class ResourceDeployer
     extend KubernetesDeploy::StatsD::MeasureMethods
+    include Krane::TemplateReporting
 
     delegate :logger, to: :@task_config
+    attr_reader :statsd_tags
 
-    def initialize(task_config:, prune_whitelist:, max_watch_seconds:, current_sha: nil, selector:, global_mode: false)
+    def initialize(task_config:, prune_whitelist:, max_watch_seconds:, current_sha: nil, selector:, statsd_tags:)
       @task_config = task_config
       @prune_whitelist = prune_whitelist
       @max_watch_seconds = max_watch_seconds
       @current_sha = current_sha
       @selector = selector
-      @global_mode = global_mode
+      @statsd_tags = statsd_tags
     end
 
-    def deploy_all_resources(resources, prune: false, verify:, record_summary: true)
-      deploy_resources(resources, prune: prune, verify: verify, record_summary: record_summary)
+    def deploy!(resources, verify_result, prune)
+      if verify_result
+        deploy_all_resources(resources, prune: prune, verify: true)
+        failed_resources = resources.reject(&:deploy_succeeded?)
+        success = failed_resources.empty?
+        if !success && failed_resources.all?(&:deploy_timed_out?)
+          raise DeploymentTimeoutError
+        end
+        raise FatalDeploymentError unless success
+      else
+        deploy_all_resources(resources, prune: prune, verify: false)
+        logger.summary.add_action("deployed #{resources.length} #{'resource'.pluralize(resources.length)}")
+        warning = <<~MSG
+          Deploy result verification is disabled for this deploy.
+          This means the desired changes were communicated to Kubernetes, but the deploy did not make sure they actually succeeded.
+        MSG
+        logger.summary.add_paragraph(ColorizedString.new(warning).yellow)
+      end
     end
-    measure_method(:deploy_all_resources, 'normal_resources.duration')
 
     def predeploy_priority_resources(resource_list, predeploy_sequence)
       bare_pods = resource_list.select { |resource| resource.is_a?(Pod) }
@@ -48,6 +66,11 @@ module KubernetesDeploy
     measure_method(:predeploy_priority_resources, 'priority_resources.duration')
 
     private
+
+    def deploy_all_resources(resources, prune: false, verify:, record_summary: true)
+      deploy_resources(resources, prune: prune, verify: verify, record_summary: record_summary)
+    end
+    measure_method(:deploy_all_resources, 'normal_resources.duration')
 
     def deploy_resources(resources, prune: false, verify:, record_summary: true)
       return if resources.empty?
@@ -124,8 +147,9 @@ module KubernetesDeploy
         end
 
         output_is_sensitive = resources.any?(&:sensitive_template_content?)
+        global_mode = resources.all?(&:global?)
         out, err, st = kubectl.run(*command, log_failure: false, output_is_sensitive: output_is_sensitive,
-          use_namespace: !@global_mode)
+          use_namespace: !global_mode)
 
         if st.success?
           log_pruning(out) if prune
@@ -203,19 +227,6 @@ module KubernetesDeploy
           bad_files << { filename: File.basename(path), err: line, content: content }
         end
       end
-    end
-
-    def record_invalid_template(err:, filename:, content: nil)
-      debug_msg = ColorizedString.new("Invalid template: #{filename}\n").red
-      debug_msg += "> Error message:\n#{FormattedLogger.indent_four(err)}"
-      if content
-        debug_msg += if content =~ /kind:\s*Secret/
-          "\n> Template content: Suppressed because it may contain a Secret"
-        else
-          "\n> Template content:\n#{FormattedLogger.indent_four(content)}"
-        end
-      end
-      logger.summary.add_paragraph(debug_msg)
     end
 
     def kubectl

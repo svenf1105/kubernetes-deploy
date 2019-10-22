@@ -43,10 +43,14 @@ require 'kubernetes-deploy/template_sets'
 require 'kubernetes-deploy/deploy_task_config_validator'
 require 'kubernetes-deploy/resource_deployer'
 
+require 'krane/concerns/template_reporting'
+
 module KubernetesDeploy
   # Ship resources to a namespace
   class DeployTask
     extend KubernetesDeploy::StatsD::MeasureMethods
+    include Krane::TemplateReporting
+    delegate :logger, to: :@task_config
 
     PROTECTED_NAMESPACES = %w(
       default
@@ -183,36 +187,8 @@ module KubernetesDeploy
       if @protected_namespaces.include?(@namespace) && prune
         raise FatalDeploymentError, "Refusing to deploy to protected namespace '#{@namespace}' with pruning enabled"
       end
+      resource_deployer.deploy!(resources, verify_result, prune)
 
-      deploy!(resource, verify_result, prune)
-    end
-
-    private
-
-    def resource_deployer
-      @resource_deployer ||= KubernetesDeploy::ResourceDeployer.new(task_config: @task_config,
-        prune_whitelist: prune_whitelist, max_watch_seconds: @max_watch_seconds,
-        selector: @selector)
-    end
-
-    def deploy!(resources, verify_result, prune, start)
-      if verify_result
-        resource_deployer.deploy_all_resources(resources, prune: prune, verify: true)
-        failed_resources = resources.reject(&:deploy_succeeded?)
-        success = failed_resources.empty?
-        if !success && failed_resources.all?(&:deploy_timed_out?)
-          raise DeploymentTimeoutError
-        end
-        raise FatalDeploymentError unless success
-      else
-        resource_deployer.deploy_all_resources(resources, prune: prune, verify: false)
-        @logger.summary.add_action("deployed #{resources.length} #{'resource'.pluralize(resources.length)}")
-        warning = <<~MSG
-          Deploy result verification is disabled for this deploy.
-          This means the desired changes were communicated to Kubernetes, but the deploy did not make sure they actually succeeded.
-        MSG
-        @logger.summary.add_paragraph(ColorizedString.new(warning).yellow)
-      end
       StatsD.event("Deployment of #{@namespace} succeeded",
         "Successfully deployed all #{@namespace} resources to #{@context}",
         alert_type: "success", tags: statsd_tags << "status:success")
@@ -233,6 +209,14 @@ module KubernetesDeploy
         alert_type: "error", tags: statsd_tags << "status:failed")
       StatsD.distribution('all_resources.duration', StatsD.duration(start), tags: statsd_tags << "status:failed")
       raise
+    end
+
+    private
+
+    def resource_deployer
+      @resource_deployer ||= KubernetesDeploy::ResourceDeployer.new(task_config: @task_config,
+        prune_whitelist: prune_whitelist, max_watch_seconds: @max_watch_seconds,
+        selector: @selector, statsd_tags: statsd_tags, current_sha: @current_sha)
     end
 
     def global_resource_names
@@ -341,25 +325,6 @@ module KubernetesDeploy
       raise FatalDeploymentError, "Failed to render and parse template"
     end
     measure_method(:discover_resources)
-
-    def record_invalid_template(err:, filename:, content: nil)
-      debug_msg = ColorizedString.new("Invalid template: #{filename}\n").red
-      debug_msg += "> Error message:\n#{FormattedLogger.indent_four(err)}"
-      if content
-        debug_msg += if content =~ /kind:\s*Secret/
-          "\n> Template content: Suppressed because it may contain a Secret"
-        else
-          "\n> Template content:\n#{FormattedLogger.indent_four(content)}"
-        end
-      end
-      @logger.summary.add_paragraph(debug_msg)
-    end
-
-    def record_warnings(warning:, filename:)
-      warn_msg = "Template warning: #{filename}\n"
-      warn_msg += "> Warning message:\n#{FormattedLogger.indent_four(warning)}"
-      @logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
-    end
 
     def validate_configuration(allow_protected_ns:, prune:)
       task_config_validator = DeployTaskConfigValidator.new(@protected_namespaces, allow_protected_ns, prune,

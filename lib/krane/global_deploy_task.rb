@@ -9,7 +9,6 @@ require 'kubernetes-deploy/kubeclient_builder'
 require 'kubernetes-deploy/cluster_resource_discovery'
 require 'kubernetes-deploy/template_sets'
 require 'kubernetes-deploy/resource_deployer'
-
 require 'kubernetes-deploy/kubernetes_resource'
 %w(
   custom_resource
@@ -19,11 +18,13 @@ require 'kubernetes-deploy/kubernetes_resource'
 end
 
 require 'krane/global_deploy_task_config_validator'
+require 'krane/concerns/template_reporting'
 
 module Krane
   # Ship global resources to a context
   class GlobalDeployTask
     extend KubernetesDeploy::StatsD::MeasureMethods
+    include Krane::TemplateReporting
     delegate :context, :logger, to: :@task_config
 
     # Initializes the deploy task
@@ -63,7 +64,6 @@ module Krane
     # Runs the task, raising exceptions in case of issues
     #
     # @param verify_result [Boolean] Wait for completion and verify success
-    # @param allow_protected_ns [Boolean] Enable deploying to protected namespaces
     # @param prune [Boolean] Enable deletion of resources that do not appear in the template dir
     #
     # @return [nil]
@@ -80,46 +80,20 @@ module Krane
       check_initial_status(resources)
 
       logger.phase_heading("Deploying all resources")
-      deploy!(resources, verify_result, prune, start)
-    end
-
-    private
-
-    def deploy!(resources, verify_result, prune, start)
-      prune_whitelist = []
-      deployer = KubernetesDeploy::ResourceDeployer.new(task_config: @task_config,
-        prune_whitelist: prune_whitelist, max_watch_seconds: @max_watch_seconds,
-        selector: @selector, global_mode: true)
-      if verify_result
-        deployer.deploy_all_resources(resources, prune: prune, verify: true)
-        failed_resources = resources.reject(&:deploy_succeeded?)
-        success = failed_resources.empty?
-        if !success && failed_resources.all?(&:deploy_timed_out?)
-          raise KubernetesDeploy::DeploymentTimeoutError
-        end
-        raise KubernetesDeploy::FatalDeploymentError unless success
-      else
-        deployer.deploy_all_resources(resources, prune: prune, verify: false)
-        logger.summary.add_action("deployed #{resources.length} #{'resource'.pluralize(resources.length)}")
-        warning = <<~MSG
-          Deploy result verification is disabled for this deploy.
-          This means the desired changes were communicated to Kubernetes, but the deploy did not make sure they actually succeeded.
-        MSG
-        logger.summary.add_paragraph(ColorizedString.new(warning).yellow)
-      end
-
+      deploy!(resources, verify_result, prune)
       StatsD.event("Deployment succeeded",
         "Successfully deployed all resources to #{context}",
         alert_type: "success", tags: statsd_tags << "status:success")
-      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start), tags: statsd_tags << "status:success")
+      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start),
+        tags: statsd_tags << "status:success")
       logger.print_summary(:success)
-
     rescue KubernetesDeploy::DeploymentTimeoutError
       logger.print_summary(:timed_out)
       StatsD.event("Deployment timed out",
         "One or more resources failed to deploy to #{context} in time",
         alert_type: "error", tags: statsd_tags << "status:timeout")
-      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start), tags: statsd_tags << "status:timeout")
+      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start),
+        tags: statsd_tags << "status:timeout")
       raise
     rescue KubernetesDeploy::FatalDeploymentError => error
       logger.summary.add_action(error.message) if error.message != error.class.to_s
@@ -127,8 +101,19 @@ module Krane
       StatsD.event("Deployment failed",
         "One or more resources failed to deploy to #{context}",
         alert_type: "error", tags: statsd_tags << "status:failed")
-      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start), tags: statsd_tags << "status:failed")
+      StatsD.distribution('all_resources.duration', KubernetesDeploy::StatsD.duration(start),
+        tags: statsd_tags << "status:failed")
       raise
+    end
+
+    private
+
+    def deploy!(resources, verify_result, prune)
+      prune_whitelist = []
+      resource_deployer = KubernetesDeploy::ResourceDeployer.new(task_config: @task_config,
+        prune_whitelist: prune_whitelist, max_watch_seconds: @max_watch_seconds,
+        selector: @selector, statsd_tags: statsd_tags)
+      resource_deployer.deploy!(resources, verify_result, prune)
     end
 
     def validate_configuration
@@ -208,7 +193,6 @@ module Krane
       %W(context:#{@context})
     end
 
-    ### Could be common
     def kubectl
       @kubectl ||= KubernetesDeploy::Kubectl.new(task_config: @task_config, log_failure_by_default: true)
     end
@@ -219,25 +203,6 @@ module Krane
 
     def global_resource_kinds
       cluster_resource_discoverer.global_resource_kinds
-    end
-
-    def record_invalid_template(err:, filename:, content: nil)
-      debug_msg = ColorizedString.new("Invalid template: #{filename}\n").red
-      debug_msg += "> Error message:\n#{KubernetesDeploy::FormattedLogger.indent_four(err)}"
-      if content
-        debug_msg += if content =~ /kind:\s*Secret/
-          "\n> Template content: Suppressed because it may contain a Secret"
-        else
-          "\n> Template content:\n#{KubernetesDeploy::FormattedLogger.indent_four(content)}"
-        end
-      end
-      logger.summary.add_paragraph(debug_msg)
-    end
-
-    def record_warnings(warning:, filename:)
-      warn_msg = "Template warning: #{filename}\n"
-      warn_msg += "> Warning message:\n#{KubernetesDeploy::FormattedLogger.indent_four(warning)}"
-      logger.summary.add_paragraph(ColorizedString.new(warn_msg).yellow)
     end
 
     def check_initial_status(resources)
