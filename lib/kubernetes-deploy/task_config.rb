@@ -2,6 +2,7 @@
 module KubernetesDeploy
   class TaskConfig
     attr_reader :context, :namespace
+    attr_accessor :global_kinds
 
     def initialize(context, namespace, logger = nil)
       @context = context
