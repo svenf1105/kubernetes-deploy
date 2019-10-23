@@ -139,7 +139,7 @@ module KubernetesDeploy
       raise EjsonSecretError, out_err unless st.success?
       JSON.parse(out_err)
     rescue JSON::ParserError
-      raise EjsonSecretError, "Failed to parse decrypted ejson"
+      raise EjsonSecretError, "Failed to parse decrypted ejson: #{out_err}"
     end
 
     def fetch_private_key_from_secret
